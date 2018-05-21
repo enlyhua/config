@@ -1,0 +1,25 @@
+### 热门话题
+*/5 * * * * flock -xn /data/log/cron/hot.topic.lock php72 /data/daemon/releases/current/console/index.php gather/generateTopic >> /data/log/cron/hot.topic.log 2>&1 &
+### 热门歌曲
+*/5 * * * * flock -xn /data/log/cron/hot.song.lock php72 /data/daemon/releases/current/console/index.php gather/generateSong >> /data/log/cron/hot.song.log 2>&1 &
+### 按时间排序的话题
+*/5 * * * * flock -xn /data/log/cron/time.topic.lock php72 /data/daemon/releases/current/console/index.php gather/generateTimeTopic >> /data/log/cron/time.topic.log 2>&1 &
+### 按时间排序的歌曲
+*/5 * * * * flock -xn /data/log/cron/time.song.lock php72 /data/daemon/releases/current/console/index.php gather/generateTimeSong >> /data/log/cron/time.song.log 2>&1 &
+### top500视频生成
+0 * * * * flock -xn /data/log/cron/home.top500.lock php72 /data/daemon/releases/current/console/index.php home/GenerateTop500 >> /data/log/cron/home.top500.log 2>&1 &
+### 首页推荐视频生成
+0 * * * * flock -xn /data/log/cron/home.recommend.lock php72 /data/daemon/releases/current/console/index.php home/GenerateRecommend >> /data/log/cron/home.recommend.log 2>&1 &
+### 作品封面图生成检查
+*/30 * * * * flock -xn /data/log/cron/setup.cover.lock php72 /data/daemon/releases/current/console/index.php setup/recordingPush >> /data/log/cron/setup.cover.log 2>&1 &
+
+### 清除首页已经删除的作品
+0 * * * * flock -xn /data/log/cron/home.cleanRedis.lock php72 /data/daemon/releases/current/console/index.php CleanRedundancy/CleanHomeCache >> /data/log/cron/home.cleanRedis.log 2>&1 &
+
+### 新增用户与作品统计
+0 1 * * * flock -xn /data/log/cron/daily.newUser.lock php72 /data/daemon/releases/current/console/index.php DailyJobs/DailyCount >> /data/log/cron/daily.newUser.log 2>&1 &
+
+### 每日运营数据发送
+0 9 * * *  php72 /data/daemon/releases/current/console/index.php DailyJobs/DAUEmail >> /data/log/cron/daily.email.log 2>&1 &
+
+*/10 * * * * /data/monitorScript/errorFileMonitor.sh  >> /data/log/cron/monitor.log 2>&1 &
