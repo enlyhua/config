@@ -1,0 +1,22 @@
+# This file is managed by Chef.
+# Do NOT modify this file directly.
+
+Defaults      !lecture,tty_tickets,!fqdn
+
+# User privilege specification
+root          ALL=(ALL) ALL
+
+
+
+# Members of the group 'sysadmin' may gain root privileges
+%sysadmin ALL=(ALL) NOPASSWD:ALL
+# Members of the group 'lang-video-be' may gain root privileges
+%lang-video-be ALL=(ALL) NOPASSWD:ALL
+# Members of the group 'lang-ops' may gain root privileges
+%lang-ops ALL=(ALL) NOPASSWD:ALL
+# Members of the group 'lang-be' may gain root privileges
+%lang-be ALL=(ALL) NOPASSWD:ALL
+# Members of the group 'lang-ci' may gain root privileges
+%lang-ci ALL=(ALL) NOPASSWD:ALL
+
+# This is not a comment; see sudoers(5) for more information on "#include" directives
