@@ -1,0 +1,559 @@
+
+运行命令：
+/sfy/bin/deploy --server-group=production --shoufuyou-php-lib=v181010.1 
+
+__________________________________________________________________
+
+1. /sfy/bin/deploy : (部署脚本) 
+#!/bin/sh -e
+root=$(dirname $(dirname $(realpath $0)))  // root = /sfy
+lock_file_name=deploy-lock  
+. $root/lib/lock  
+$root/lib/deploy "$@" 2>&1 | tee -a $root/log/deploy/$(date +%Y-%m-%d).log  // 执行 /sfy/lib/deploy 
+
+
+__________________________________________________________________
+
+2./sfy/lib/lock : (锁文件)
+#!/bin/sh
+lock="$root/tmp/$lock_file_name"
+if (set -o noclobber; echo "$$" > "$lock") 2> /dev/null; then
+    trap 'rm -f "$lock"; exit $?' INT TERM EXIT  // 捕获信号，退出的时候删除锁文件
+else
+    echo "Error: already started: $(cat $lock)" 1>&2
+    exit 1
+fi
+
+__________________________________________________________________
+
+3./sfy/lib/deploy (主要部署脚本)
+#!/bin/sh
+set -o errexit
+set -o pipefail
+cat <<EOF
+
+      _/_/_/  _/                                _/_/
+   _/        _/_/_/      _/_/    _/    _/    _/      _/    _/  _/    _/    _/_/    _/    _/
+    _/_/    _/    _/  _/    _/  _/    _/  _/_/_/_/  _/    _/  _/    _/  _/    _/  _/    _/
+       _/  _/    _/  _/    _/  _/    _/    _/      _/    _/  _/    _/  _/    _/  _/    _/
+_/_/_/    _/    _/    _/_/      _/_/_/    _/        _/_/_/    _/_/_/    _/_/      _/_/_/
+                                                                 _/
+                                                            _/_/
+EOF
+
+echo "Start to deploy at: $(date "+%Y-%m-%d %H:%M:%S")"
+args="$@"  // $@ 所有参数
+echo 'Options: '$args
+
+readonly root=$(dirname "$(dirname "$(readlink -f "$0")")")   // $root = /sfy
+readonly deployment_root=$(cat $root/config/deployment-root)   // $deployment_root = /sfy
+
+
+projects=($(find $root/projects -maxdepth 1 -type d -printf '%P\n'))  // /sfy/projects 下面的项目
+
+deployment_number=$(cat $root/var/deployment-number)  // 发布的递增数字
+let deployment_number+=1
+echo $deployment_number > $root/var/deployment-number
+echo "Deployment number: $deployment_number"
+
+. $root/lib/functions
+cd $root
+if [ "$(git status -s)" != '' ]; then
+    git add -A
+    git commit -m "[$deployment_number] $args"
+fi
+
+options='server-group:'
+
+for project in ${projects[@]}; do
+    options="$options,$project:"  //server-group:,feixingdai-app-api:,shoufuyou-php-lib:,shoufuyou-mobile:
+done
+
+tmp=$(getopt -o '' --long $options -- "$@")  // --server-group 'production' --shoufuyou-php-lib 'v181010.1' --
+
+if [ $? != 0 ]; then
+    exit 1
+fi
+
+eval set -- "$tmp"
+declare -A project_versions
+server_group=''    // production
+while [ "$1" != '' ]; do
+    if [[ $1 == "--" ]]; then
+        shift
+        break
+    fi
+    if [[ $1 == "--server-group" ]]; then
+        server_group=${2}   // $server_group = production
+    else
+        project_versions[${1/--/}]=${2}
+    fi
+    shift 2
+done
+if [[  $server_group == '' ]]; then
+    >&2 echo "Error: server group is missing."
+    exit 1
+fi
+
+
+get_projects_cmd=$root/lib/get-deployment-projects
+for project in ${!project_versions[@]}; do
+    get_projects_cmd="$get_projects_cmd $project"   // python 脚本获取部署项目依赖 ，get_projects_cmd =  /sfy/lib/get-deployment-projects shoufuyou-php-lib
+done
+
+declare -A previous_versions
+
+//查找上一个版本
+for project in ${!project_versions[@]}; do
+    if [ -f /sfy/projects/$project/versions/$server_group/current ]; then    // /sfy/projects/shoufuyou-php-lib/versions/production
+        previous_versions+=$(find /sfy/projects/$project/versions/$server_group/current -ls | sed -r 's/.*->//' | sed 's%/data1/sfy/projects/%--%' | sed "s%/versions/$server_group/%=%" | sed -r 's/-[0-9]+$//')
+    fi
+done
+
+echo Rollback command: /sfy/bin/deploy --server-group=$server_group$previous_versions
+
+// python 输出结果  shoufuyou-php-lib
+projects=($($get_projects_cmd))  // /sfy/lib/get-deployment-projects shoufuyou-php-lib
+
+
+//递增下个版本
+declare -A deployment_versions
+for project in ${projects[@]}; do
+    if [ ! -d $root/projects/$project/versions/$server_group ]; then  // /sfy/projects/shoufuyou-php-lib/versions/production
+        deployment_versions[$project]=${project_versions[$project]}   
+        continue
+    fi
+    get_next_version_cmd="$root/lib/get-next-deployment-version $root/projects/$project/versions/$server_group"
+    if [[ ${project_versions[$project]+YES} == 'YES' ]]; then 
+        version=${project_versions[$project]}
+        get_next_version_cmd="$get_next_version_cmd $version"  // /sfy/lib/get-next-deployment-version /sfy/projects/shoufuyou-php-lib/versions/production v181010.1
+    fi
+    deployment_versions[$project]=$($get_next_version_cmd)
+done
+
+
+declare -A git_tags
+for project in ${projects[@]}; do
+    if [[ ${project_versions[$project]+YES} == 'YES' ]]; then 
+        git_tags[$project]=${project_versions[$project]}
+    else
+        tmp=$($root/lib/get-deployment-version $root/projects/$project/versions/$server_group)
+        git_tags[$project]=${tmp//-*/}
+    fi
+done
+
+
+updated_web_servers=()
+for project in ${projects[@]}; do
+    echo "Project: $project"
+
+    //  更新跳板机的代码
+    repository_root=$root/projects/$project/repository    // 项目目录 : /sfy/projects/shoufuyou-php-lib/repository
+    cd $repository_root
+    git reset --hard  // 显示当前在哪个 commit 
+    git fetch 
+    git checkout ${git_tags[$project]}
+    if [ -d $root/projects/$project/config/files ]; then   // /sfy/projects/shoufuyou-php-lib/config/files
+        cp -rf $root/projects/$project/config/files/* $repository_root
+    fi
+
+    //部署版本 v181010.1
+    deployment_version=${deployment_versions[$project]}  
+
+    // /sfy/projects/shoufuyou-php-lib/versions/production
+    mkdir -p $root/projects/$project/versions/$server_group   
+
+    //创建部署版本
+    touch $root/projects/$project/versions/$server_group/$deployment_version
+
+    //创建软连 ， current -> /data1/sfy/projects/shoufuyou-php-lib/versions/production/v181010.1
+    ln -sf $root/projects/$project/versions/$server_group/$deployment_version $root/projects/$project/versions/$server_group/current
+
+    // /sfy/projects/shoufuyou-php-lib/config/type  type 类型 ：lib,website,web,h5, asset-lib...
+    type=$(cat $root/projects/$project/config/type)  
+
+    //有前端代码依赖
+    if [[ $type == "asset-lib" ]]; then
+        cd grunt
+        npm install
+    fi
+
+    //哪些 server 机器
+    servers=($(cat $root/projects/$project/config/servers/$server_group))  // /sfy/projects/shoufuyou-php-lib/config/servers/production
+    sfyweb1s
+    sfyweb2s
+    sfyservice1
+    sfyservice2
+    sfysdk1
+    sfysdk2
+    sfytask1s
+
+    upload_config=($(cat $root/config/upload)) 
+    //shoufuyou-mobile
+    //shoufuyou-www
+    //shoufuyou-console
+    //shoufuyou-app-api
+    //shoufuyou-supplier
+
+
+    xyf_upload_config=($(cat $root/config/xyf_upload))
+    // xinyongfei-mobile
+    // xinyongfei-app-api
+
+
+    //依次登录到 server 机器
+
+    is_compiled=NO
+    for server in ${servers[@]}; do
+        echo "Server: $server"
+
+        // cd /sfy/projects/shoufuyou-php-lib/repository
+        cd $repository_root
+        rcmd="ssh root@$server"
+
+        //如果是 static 直接 rsync
+        if [[ $type == "static" ]]; then
+            $rcmd "mkdir -p $deployment_root/projects/$project/files/"
+            rsync -azvessh --delete --exclude=/.git $repository_root/* root@$server:$deployment_root/projects/$project/files
+            continue
+        fi
+
+        //  /sfy/projects/shoufuyou-php-lib/releases/v181010.1-10
+        release_root=$deployment_root/projects/$project/releases/$deployment_version  
+
+        // /sfy/projects/shoufuyou-php-lib
+        project_root=$deployment_root/projects/$project    
+
+        // 181010.1-10
+        asset_version=$(echo $deployment_version | sed 's/^v//')  
+
+        if [[ $type == "website" ]]; then
+            if [[ $is_compiled == 'NO' ]]; then
+                tmp=$($root/lib/get-deployment-version $root/projects/shoufuyou-asset-lib/versions/$server_group)
+                cd $root/projects/shoufuyou-asset-lib/repository/grunt
+                git checkout ${tmp//-*/}
+                npm install
+                cd -
+                cd assets
+                if [[ $project == "feixingdai-"* ]]; then
+                    echo "module.exports = require('$root/projects/feixingdai-asset-lib/repository/grunt/gruntfile-builder').build();" > Gruntfile.js
+                else
+                    echo "module.exports = require('$root/projects/shoufuyou-asset-lib/repository/grunt/gruntfile-builder').build();" > Gruntfile.js
+                fi
+                npm install
+                grunt_cmd="grunt --asset-version=$asset_version --php-tool-path=$root/lib/tool"
+                v2_config=($(cat $root/config/v2))
+                if in_array v2_config $project; then
+                    grunt_cmd="$grunt_cmd --web-root-path-prefix=v2"
+                fi
+                $grunt_cmd
+                is_compiled=YES
+            fi
+        elif [[ $type == "website2" ]]; then
+            if [[ $is_compiled == 'NO' ]]; then
+                cd assets
+                npm install
+                npm run build
+                is_compiled=YES
+            fi
+        fi
+
+        // 创建目标 server 机器 版本目录 /sfy/projects/shoufuyou-php-lib/releases/v181011
+        $rcmd "mkdir -p $deployment_root/projects/$project/releases/"
+
+        if [[ $type == "h5" ]]; then
+            if [[ $is_compiled == 'NO' ]]; then
+                npm install
+                npm run build
+                is_compiled=YES
+            fi
+            $rcmd "mkdir -p $release_root"
+            rsync -azvessh --delete $repository_root/dist/* root@$server:$release_root/dist
+        elif [[ $type == "website2" ]]; then
+            rsync -azvessh --delete --exclude=/.git --exclude=/log --exclude=/data/dynamic --exclude=/tmp --exclude=/public/assets/* --include=/assets/dist --include=/assets/dist/* --exclude=/assets/* $repository_root/* root@$server:$release_root
+        else
+            rsync -azvessh --delete --exclude=/.git --exclude=/log --exclude=/data/dynamic --exclude=/tmp --include=/public/assets --include=/public/assets/$asset_version --exclude=/public/assets/* --exclude=/assets $repository_root/* root@$server:$release_root
+        fi
+        if [[ $type != "lib" ]] && [[ $type != "h5" ]]; then
+            symlinks=(log data/dynamic tmp)
+            for symlink in ${symlinks[@]}; do
+                $rcmd "mkdir -p $project_root/$symlink"
+                if [[ $type == 'task' ]]; then
+                    $rcmd "chown sfyd:sfyd $project_root/$symlink"
+                else
+                    $rcmd "chown php-fpm:www $project_root/$symlink"
+                fi
+                if  [[ $symlink == 'data/dynamic' ]]; then
+                    $rcmd "mkdir -p $release_root/data"
+                fi
+                $rcmd "ln -s $project_root/$symlink $release_root/$symlink"
+            done
+            libs=$($rcmd "find $deployment_root/config/lib-versions -maxdepth 1 -type f -printf '%P\n'")
+            for lib in ${libs[@]}; do
+                if [ -d $root/projects/$lib/versions ]; then
+                    dependencies=($($root/lib/get-deployment-projects $lib))
+                    if in_array dependencies $project; then
+                        lib_version=$($rcmd "cat $deployment_root/config/lib-versions/$lib")
+                        $rcmd "mkdir -p $release_root/vendor"
+                        $rcmd "ln -s $deployment_root/projects/$lib/releases/$lib_version $release_root/vendor/$lib"
+                    fi
+                fi
+            done
+            $rcmd "cd $release_root && php /sfy/lib/composer.phar --no-dev update"
+        fi
+        if [[ $type == "web" ]] || [[ $type == "website" ]] || [[ $type == "website2" ]]; then
+            if in_array upload_config $project; then
+                if [[ $type == "website2" ]]; then
+                    $rcmd "ln -s /sfystatic/upload $release_root/assets/dist/upload"
+                else
+                    $rcmd "ln -s /sfystatic/upload $release_root/public/upload"
+                fi
+            fi
+            if in_array xyf_upload_config $project; then
+                if [[ $type == "website2" ]]; then
+                    $rcmd "ln -s /xyfstatic/upload $release_root/assets/dist/upload"
+                else
+                    $rcmd "ln -s /xyfstatic/upload $release_root/public/upload"
+                fi
+            fi
+            $rcmd "echo 'root $release_root/public;' > $deployment_root/config/nginx/root/$project"
+            if [[ $type == "website2" ]]; then
+                $rcmd "echo 'root $release_root/assets/dist;' > $deployment_root/config/nginx/root/$project-frontend"
+            fi
+            if ! in_array updated_web_servers $server; then
+                updated_web_servers+=($server)
+            fi
+        elif [[ $type == "h5" ]]; then
+            $rcmd "echo 'root $release_root/dist;' > $deployment_root/config/nginx/root/$project"
+            if ! in_array updated_web_servers $server; then
+                updated_web_servers+=($server)
+            fi
+        elif [[ $type == "task" ]]; then
+            if [[ $project == "shoufuyou-pay-task" ]]; then
+                $rcmd "mkdir -p $deployment_root/bin"
+                $rcmd "ln -sf $deployment_root/projects/shoufuyou-pay-task/releases/$deployment_version/run $deployment_root/bin/pay-task"
+            fi
+            if [[ $project == "shoufuyou-sms-task" ]]; then
+                $rcmd "mkdir -p $deployment_root/bin"
+                $rcmd "ln -sf $deployment_root/projects/shoufuyou-sms-task/releases/$deployment_version/run $deployment_root/bin/sms-task"
+            fi
+            if [[ $project == "shoufuyou-task" ]]; then
+                $rcmd "mkdir -p $deployment_root/bin"
+                $rcmd "ln -sf $deployment_root/projects/shoufuyou-task/releases/$deployment_version/run $deployment_root/bin/task"
+            fi
+            if [[ $project == "shoufuyou-task" ]] || [[ $project == "shoufuyou-pay-task" ]] || [[ $project == "shoufuyou-sms-task" ]]; then
+                daemons=$(cat $root/config/daemons)
+                for daemon in ${daemons[@]}; do
+                    $rcmd "systemctl restart $daemon"
+                done
+                crontab=$(cat $root/config/crontab)
+                $rcmd "echo '$crontab' | crontab -"
+            fi
+
+
+        elif [[ $type == "lib" ]]; then
+            $rcmd "mkdir -p $deployment_root/config/lib-versions"   //  /sfy/config/lib-versions 在这里写入版本号
+            $rcmd "echo $deployment_version > $deployment_root/config/lib-versions/$project"  // /sfy/config/lib-versions/shoufuyou-php-lib 
+        else
+            >&2 echo "Error: type '$type' is unknown." 
+            exit 1
+        fi
+    done
+done
+
+
+for server in ${updated_web_servers[@]}; do
+    echo "Server: $server"
+    rcmd="ssh root@$server"
+
+    // 获取 server 机器下个可用端口
+    port=$($root/lib/get-next-port $server)
+
+    // 将 部署 number 和 port 写入 /sfy/tmp/php-fpm.conf 中
+    php $root/config/php-fpm.conf.php $deployment_number $port > $root/tmp/php-fpm.conf
+
+    //上传到 server 机器
+    scp $root/tmp/php-fpm.conf $server:/usr/local/php/etc/php-fpm.conf
+    
+    rm $root/tmp/php-fpm.conf
+
+    // 登录 server 机器，将下个可用端口写入  /sfy/config/nginx/php-fpm
+    $rcmd "echo 'fastcgi_pass 127.0.0.1:$port;' > $deployment_root/config/nginx/php-fpm" 
+
+    // 固定匹配
+    cmd="$rcmd ps axo command | grep -xF '/bin/bash /sfy/lib/wait_for_fastcgi' | wc -l"
+
+    // 不为0，等待60s
+    count=$($cmd)
+    if [[ $count != 0 ]]; then
+        echo "Waiting for previous php-fpm shutdown operation..."
+        while [[ $count != 0 ]]; do
+            sleep 1
+            count=$($cmd)
+        done
+    fi
+
+    service_paths=()
+
+    // 查找 php-fpm 的 systemd 启动文件，tmp = /etc/systemd/system/php-fpm.6991.service
+    tmp=($($rcmd "find /etc/systemd/system/ -maxdepth 1 -name 'php-fpm\.*'"))
+
+    for service_path in ${tmp[@]}; do
+        service=$(basename $service_path)
+        cmd="/sfy/lib/wait_for_fastcgi && systemctl stop $service && rm -f $service_path"
+        count=$($rcmd "ps axo command | grep -xF 'sh -c $cmd' | wc -l")
+        if [[ $count == 0 ]]; then
+            $rcmd "systemctl disable $service"   //先把之前的 php-fpm.conf 配置取消开机启动
+            service_paths+=($service_path)
+        fi
+    done
+
+    // 部署机器 ： /sfy/config/php-fpm.service.php  
+    php $root/config/php-fpm.service.php $deployment_number > $root/tmp/php-fpm.service
+
+    // 把 生成的 php-fpm 的 systemd copy 到 server 机器,  /etc/systemd/system/php-fpm.6992.service
+    scp $root/tmp/php-fpm.service $server:/etc/systemd/system/php-fpm.$deployment_number.service
+
+    rm $root/tmp/php-fpm.service
+
+    //新开 php-fpm.conf
+    $rcmd "systemctl enable php-fpm.$deployment_number"
+    $rcmd "systemctl start php-fpm.$deployment_number"
+    $rcmd 'systemctl reload nginx'
+
+
+    // 等待60s后，删除老的。
+    for service_path in ${service_paths[@]}; do
+        service=$(basename $service_path)
+        cmd="/sfy/lib/wait_for_fastcgi && systemctl stop $service && rm -f $service_path"
+        $rcmd "nohup sh -c '$cmd' > /dev/null 2>&1 &"
+    done
+
+
+done
+echo "Deploy finished at: $(date "+%Y-%m-%d %H:%M:%S")"
+echo Done!
+
+__________________________________________________________________
+
+4./sfy/lib/functions
+#!/bin/sh
+in_array() {
+    local array="$1[@]"; shift
+    local needle=$1; shift
+    local result=1
+    for element in "${!array}"; do
+        if [[ $element == $needle ]]; then
+            result=0
+            break
+        fi
+    done
+    return $result
+}
+
+__________________________________________________________________
+
+5./sfy/lib/get-deployment-projects : python 脚本，查找项目依赖关系
+
+#!/usr/bin/env python
+import sys
+import os
+from collections import deque
+
+def sort(graph):
+    order, enter, state = deque(), set(graph), {}
+    def dfs(node):
+        state[node] = 0
+        for k in graph.get(node, ()):
+            sk = state.get(k, None)
+            if sk == 0: raise ValueError("Config error.")
+            if sk == 1: continue
+            enter.discard(k)
+            dfs(k)
+        order.appendleft(node)
+        state[node] = 1
+    while enter: dfs(enter.pop())
+    return order
+
+def add_project(result, project):
+    if project in result:
+        return
+    result[project] = []
+    for dependency in projects[project]:
+        result[project].append(dependency)
+        add_project(result, dependency)
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  // root = /sfy
+projects = {}
+for project in os.listdir(root + '/projects/'):
+    projects[project] = []                      // {'feixingdai-app-api': []} 
+
+
+for project in os.listdir(root + '/projects/'):
+    path = root + "/projects/" + project + "/config/dependencies"   //  path = /sfy/projects/shoufuyou-mobile/config/dependencies, 查看项目依赖
+    if os.path.exists(path):
+        f = open(path, "r")
+        content = f.read()
+        f.close()
+        for dependency in content.split("\n"):
+            dependency = dependency.strip()
+            if dependency != "":
+                projects[dependency].append(project)   // projects = {'shoufuyou-mobile': [], 'feixingdai-app-api': [], 'shoufuyou-php-lib': []}
+index = 0
+result = {}
+while index < len(sys.argv):
+    if index == 0:
+        index = index + 1
+        continue
+    add_project(result, sys.argv[index])
+    index = index + 1
+tmp = sort(result)
+tmp.reverse()
+while (len(tmp) > 0):
+    print tmp.pop()    // shoufuyou-php-lib
+
+
+__________________________________________________________________
+
+6./sfy/lib/get-next-deployment-version
+#!/bin/sh -e
+if [ -z "$2" ]; then
+    if [ ! -f $1/current ]; then
+        >&2 echo "Error: file '$1/current' is missing."
+        exit 1
+    fi
+    dir=$(dirname "$0")
+    tmp=$($dir/get-deployment-version $1)
+    version=$(echo $tmp | sed 's/-[0-9]*$//')
+else
+    version=$2
+fi
+result=$version
+versions=$(find $1 -name "$version-*")
+if [[ $versions != '' ]]; then
+    deployment_versions=${versions//$1\/$version-/}
+    result=$version-$(($(echo "$deployment_versions" | sort -nr | head -1) + 1))
+elif [ -f $1/$result ]; then
+    result=$version-1
+fi
+echo $result
+
+__________________________________________________________________
+
+7./sfy/lib/get-next-port
+
+#!/bin/sh
+if [ -z "$2" ]; then
+    start=10000
+else
+    start=$2
+fi
+for port in $(seq $start 19999); do
+    tmp=$(ssh root@$1 lsof -i :$port)
+    if [[ $tmp == '' ]]; then
+        echo $port
+        exit
+    fi
+done
+>&2 echo "Error: server '$1' has no free port."
+exit 1

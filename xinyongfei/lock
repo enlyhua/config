@@ -1,0 +1,8 @@
+#!/bin/sh
+lock="$root/tmp/$lock_file_name"
+if (set -o noclobber; echo "$$" > "$lock") 2> /dev/null; then
+    trap 'rm -f "$lock"; exit $?' INT TERM EXIT
+else
+    echo "Error: already started: $(cat $lock)" 1>&2
+    exit 1
+fi

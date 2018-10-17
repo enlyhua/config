@@ -1,0 +1,5 @@
+#!/bin/sh -e
+root=$(dirname $(dirname $(realpath $0)))
+lock_file_name=deploy-lock
+. $root/lib/lock
+$root/lib/deploy "$@" 2>&1 | tee -a $root/log/deploy/$(date +%Y-%m-%d).log

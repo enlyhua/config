@@ -1,0 +1,296 @@
+#!/bin/sh
+set -o errexit
+set -o pipefail
+cat <<EOF
+
+      _/_/_/  _/                                _/_/
+   _/        _/_/_/      _/_/    _/    _/    _/      _/    _/  _/    _/    _/_/    _/    _/
+    _/_/    _/    _/  _/    _/  _/    _/  _/_/_/_/  _/    _/  _/    _/  _/    _/  _/    _/
+       _/  _/    _/  _/    _/  _/    _/    _/      _/    _/  _/    _/  _/    _/  _/    _/
+_/_/_/    _/    _/    _/_/      _/_/_/    _/        _/_/_/    _/_/_/    _/_/      _/_/_/
+                                                                 _/
+                                                            _/_/
+EOF
+echo "Start to deploy at: $(date "+%Y-%m-%d %H:%M:%S")"
+args="$@"
+echo 'Options: '$args
+readonly root=$(dirname "$(dirname "$(readlink -f "$0")")")
+readonly deployment_root=$(cat $root/config/deployment-root)
+projects=($(find $root/projects -maxdepth 1 -type d -printf '%P\n'))
+deployment_number=$(cat $root/var/deployment-number)
+let deployment_number+=1
+echo $deployment_number > $root/var/deployment-number
+echo "Deployment number: $deployment_number"
+. $root/lib/functions
+cd $root
+if [ "$(git status -s)" != '' ]; then
+    git add -A
+    git commit -m "[$deployment_number] $args"
+fi
+options='server-group:'
+for project in ${projects[@]}; do
+    options="$options,$project:"
+done
+tmp=$(getopt -o '' --long $options -- "$@")
+if [ $? != 0 ]; then
+    exit 1
+fi
+eval set -- "$tmp"
+declare -A project_versions
+server_group=''
+while [ "$1" != '' ]; do
+    if [[ $1 == "--" ]]; then
+        shift
+        break
+    fi
+    if [[ $1 == "--server-group" ]]; then
+        server_group=${2}
+    else
+        project_versions[${1/--/}]=${2}
+    fi
+    shift 2
+done
+if [[  $server_group == '' ]]; then
+    >&2 echo "Error: server group is missing."
+    exit 1
+fi
+get_projects_cmd=$root/lib/get-deployment-projects
+for project in ${!project_versions[@]}; do
+    get_projects_cmd="$get_projects_cmd $project"
+done
+declare -A previous_versions
+for project in ${!project_versions[@]}; do
+    if [ -f /sfy/projects/$project/versions/$server_group/current ]; then
+        previous_versions+=$(find /sfy/projects/$project/versions/$server_group/current -ls | sed -r 's/.*->//' | sed 's%/data1/sfy/projects/%--%' | sed "s%/versions/$server_group/%=%" | sed -r 's/-[0-9]+$//')
+    fi
+done
+echo Rollback command: /sfy/bin/deploy --server-group=$server_group$previous_versions
+projects=($($get_projects_cmd))
+declare -A deployment_versions
+for project in ${projects[@]}; do
+    if [ ! -d $root/projects/$project/versions/$server_group ]; then
+        deployment_versions[$project]=${project_versions[$project]}
+        continue
+    fi
+    get_next_version_cmd="$root/lib/get-next-deployment-version $root/projects/$project/versions/$server_group"
+    if [[ ${project_versions[$project]+YES} == 'YES' ]]; then 
+        version=${project_versions[$project]}
+        get_next_version_cmd="$get_next_version_cmd $version"
+    fi
+    deployment_versions[$project]=$($get_next_version_cmd)
+done
+declare -A git_tags
+for project in ${projects[@]}; do
+    if [[ ${project_versions[$project]+YES} == 'YES' ]]; then 
+        git_tags[$project]=${project_versions[$project]}
+    else
+        tmp=$($root/lib/get-deployment-version $root/projects/$project/versions/$server_group)
+        git_tags[$project]=${tmp//-*/}
+    fi
+done
+updated_web_servers=()
+for project in ${projects[@]}; do
+    echo "Project: $project"
+    repository_root=$root/projects/$project/repository
+    cd $repository_root
+    git reset --hard
+    git fetch
+    git checkout ${git_tags[$project]}
+    if [ -d $root/projects/$project/config/files ]; then
+        cp -rf $root/projects/$project/config/files/* $repository_root
+    fi
+    deployment_version=${deployment_versions[$project]}
+    mkdir -p $root/projects/$project/versions/$server_group
+    touch $root/projects/$project/versions/$server_group/$deployment_version
+    ln -sf $root/projects/$project/versions/$server_group/$deployment_version $root/projects/$project/versions/$server_group/current
+    type=$(cat $root/projects/$project/config/type)
+    if [[ $type == "asset-lib" ]]; then
+        cd grunt
+        npm install
+    fi
+    servers=($(cat $root/projects/$project/config/servers/$server_group))
+    upload_config=($(cat $root/config/upload))
+    xyf_upload_config=($(cat $root/config/xyf_upload))
+    is_compiled=NO
+    for server in ${servers[@]}; do
+        echo "Server: $server"
+        cd $repository_root
+        rcmd="ssh root@$server"
+        if [[ $type == "static" ]]; then
+            $rcmd "mkdir -p $deployment_root/projects/$project/files/"
+            rsync -azvessh --delete --exclude=/.git $repository_root/* root@$server:$deployment_root/projects/$project/files
+            continue
+        fi
+        release_root=$deployment_root/projects/$project/releases/$deployment_version
+        project_root=$deployment_root/projects/$project
+        asset_version=$(echo $deployment_version | sed 's/^v//')
+        if [[ $type == "website" ]]; then
+            if [[ $is_compiled == 'NO' ]]; then
+                tmp=$($root/lib/get-deployment-version $root/projects/shoufuyou-asset-lib/versions/$server_group)
+                cd $root/projects/shoufuyou-asset-lib/repository/grunt
+                git checkout ${tmp//-*/}
+                npm install
+                cd -
+                cd assets
+                if [[ $project == "feixingdai-"* ]]; then
+                    echo "module.exports = require('$root/projects/feixingdai-asset-lib/repository/grunt/gruntfile-builder').build();" > Gruntfile.js
+                else
+                    echo "module.exports = require('$root/projects/shoufuyou-asset-lib/repository/grunt/gruntfile-builder').build();" > Gruntfile.js
+                fi
+                npm install
+                grunt_cmd="grunt --asset-version=$asset_version --php-tool-path=$root/lib/tool"
+                v2_config=($(cat $root/config/v2))
+                if in_array v2_config $project; then
+                    grunt_cmd="$grunt_cmd --web-root-path-prefix=v2"
+                fi
+                $grunt_cmd
+                is_compiled=YES
+            fi
+        elif [[ $type == "website2" ]]; then
+            if [[ $is_compiled == 'NO' ]]; then
+                cd assets
+                npm install
+                npm run build
+                is_compiled=YES
+            fi
+        fi
+        $rcmd "mkdir -p $deployment_root/projects/$project/releases/"
+        if [[ $type == "h5" ]]; then
+            if [[ $is_compiled == 'NO' ]]; then
+                npm install
+                npm run build
+                is_compiled=YES
+            fi
+            $rcmd "mkdir -p $release_root"
+            rsync -azvessh --delete $repository_root/dist/* root@$server:$release_root/dist
+        elif [[ $type == "website2" ]]; then
+            rsync -azvessh --delete --exclude=/.git --exclude=/log --exclude=/data/dynamic --exclude=/tmp --exclude=/public/assets/* --include=/assets/dist --include=/assets/dist/* --exclude=/assets/* $repository_root/* root@$server:$release_root
+        else
+            rsync -azvessh --delete --exclude=/.git --exclude=/log --exclude=/data/dynamic --exclude=/tmp --include=/public/assets --include=/public/assets/$asset_version --exclude=/public/assets/* --exclude=/assets $repository_root/* root@$server:$release_root
+        fi
+        if [[ $type != "lib" ]] && [[ $type != "h5" ]]; then
+            symlinks=(log data/dynamic tmp)
+            for symlink in ${symlinks[@]}; do
+                $rcmd "mkdir -p $project_root/$symlink"
+                if [[ $type == 'task' ]]; then
+                    $rcmd "chown sfyd:sfyd $project_root/$symlink"
+                else
+                    $rcmd "chown php-fpm:www $project_root/$symlink"
+                fi
+                if  [[ $symlink == 'data/dynamic' ]]; then
+                    $rcmd "mkdir -p $release_root/data"
+                fi
+                $rcmd "ln -s $project_root/$symlink $release_root/$symlink"
+            done
+            libs=$($rcmd "find $deployment_root/config/lib-versions -maxdepth 1 -type f -printf '%P\n'")
+            for lib in ${libs[@]}; do
+                if [ -d $root/projects/$lib/versions ]; then
+                    dependencies=($($root/lib/get-deployment-projects $lib))
+                    if in_array dependencies $project; then
+                        lib_version=$($rcmd "cat $deployment_root/config/lib-versions/$lib")
+                        $rcmd "mkdir -p $release_root/vendor"
+                        $rcmd "ln -s $deployment_root/projects/$lib/releases/$lib_version $release_root/vendor/$lib"
+                    fi
+                fi
+            done
+            $rcmd "cd $release_root && php /sfy/lib/composer.phar --no-dev update"
+        fi
+        if [[ $type == "web" ]] || [[ $type == "website" ]] || [[ $type == "website2" ]]; then
+            if in_array upload_config $project; then
+                if [[ $type == "website2" ]]; then
+                    $rcmd "ln -s /sfystatic/upload $release_root/assets/dist/upload"
+                else
+                    $rcmd "ln -s /sfystatic/upload $release_root/public/upload"
+                fi
+            fi
+            if in_array xyf_upload_config $project; then
+                if [[ $type == "website2" ]]; then
+                    $rcmd "ln -s /xyfstatic/upload $release_root/assets/dist/upload"
+                else
+                    $rcmd "ln -s /xyfstatic/upload $release_root/public/upload"
+                fi
+            fi
+            $rcmd "echo 'root $release_root/public;' > $deployment_root/config/nginx/root/$project"
+            if [[ $type == "website2" ]]; then
+                $rcmd "echo 'root $release_root/assets/dist;' > $deployment_root/config/nginx/root/$project-frontend"
+            fi
+            if ! in_array updated_web_servers $server; then
+                updated_web_servers+=($server)
+            fi
+        elif [[ $type == "h5" ]]; then
+            $rcmd "echo 'root $release_root/dist;' > $deployment_root/config/nginx/root/$project"
+            if ! in_array updated_web_servers $server; then
+                updated_web_servers+=($server)
+            fi
+        elif [[ $type == "task" ]]; then
+            if [[ $project == "shoufuyou-pay-task" ]]; then
+                $rcmd "mkdir -p $deployment_root/bin"
+                $rcmd "ln -sf $deployment_root/projects/shoufuyou-pay-task/releases/$deployment_version/run $deployment_root/bin/pay-task"
+            fi
+            if [[ $project == "shoufuyou-sms-task" ]]; then
+                $rcmd "mkdir -p $deployment_root/bin"
+                $rcmd "ln -sf $deployment_root/projects/shoufuyou-sms-task/releases/$deployment_version/run $deployment_root/bin/sms-task"
+            fi
+            if [[ $project == "shoufuyou-task" ]]; then
+                $rcmd "mkdir -p $deployment_root/bin"
+                $rcmd "ln -sf $deployment_root/projects/shoufuyou-task/releases/$deployment_version/run $deployment_root/bin/task"
+            fi
+            if [[ $project == "shoufuyou-task" ]] || [[ $project == "shoufuyou-pay-task" ]] || [[ $project == "shoufuyou-sms-task" ]]; then
+                daemons=$(cat $root/config/daemons)
+                for daemon in ${daemons[@]}; do
+                    $rcmd "systemctl restart $daemon"
+                done
+                crontab=$(cat $root/config/crontab)
+                $rcmd "echo '$crontab' | crontab -"
+            fi
+        elif [[ $type == "lib" ]]; then
+            $rcmd "mkdir -p $deployment_root/config/lib-versions"
+            $rcmd "echo $deployment_version > $deployment_root/config/lib-versions/$project"
+        else
+            >&2 echo "Error: type '$type' is unknown." 
+            exit 1
+        fi
+    done
+done
+for server in ${updated_web_servers[@]}; do
+    echo "Server: $server"
+    rcmd="ssh root@$server"
+    port=$($root/lib/get-next-port $server)
+    php $root/config/php-fpm.conf.php $deployment_number $port > $root/tmp/php-fpm.conf
+    scp $root/tmp/php-fpm.conf $server:/usr/local/php/etc/php-fpm.conf
+    rm $root/tmp/php-fpm.conf
+    $rcmd "echo 'fastcgi_pass 127.0.0.1:$port;' > $deployment_root/config/nginx/php-fpm"
+    cmd="$rcmd ps axo command | grep -xF '/bin/bash /sfy/lib/wait_for_fastcgi' | wc -l"
+    count=$($cmd)
+    if [[ $count != 0 ]]; then
+        echo "Waiting for previous php-fpm shutdown operation..."
+        while [[ $count != 0 ]]; do
+            sleep 1
+            count=$($cmd)
+        done
+    fi
+    service_paths=()
+    tmp=($($rcmd "find /etc/systemd/system/ -maxdepth 1 -name 'php-fpm\.*'"))
+    for service_path in ${tmp[@]}; do
+        service=$(basename $service_path)
+        cmd="/sfy/lib/wait_for_fastcgi && systemctl stop $service && rm -f $service_path"
+        count=$($rcmd "ps axo command | grep -xF 'sh -c $cmd' | wc -l")
+        if [[ $count == 0 ]]; then
+            $rcmd "systemctl disable $service"
+            service_paths+=($service_path)
+        fi
+    done
+    php $root/config/php-fpm.service.php $deployment_number > $root/tmp/php-fpm.service
+    scp $root/tmp/php-fpm.service $server:/etc/systemd/system/php-fpm.$deployment_number.service
+    rm $root/tmp/php-fpm.service
+    $rcmd "systemctl enable php-fpm.$deployment_number"
+    $rcmd "systemctl start php-fpm.$deployment_number"
+    $rcmd 'systemctl reload nginx'
+    for service_path in ${service_paths[@]}; do
+        service=$(basename $service_path)
+        cmd="/sfy/lib/wait_for_fastcgi && systemctl stop $service && rm -f $service_path"
+        $rcmd "nohup sh -c '$cmd' > /dev/null 2>&1 &"
+    done
+done
+echo "Deploy finished at: $(date "+%Y-%m-%d %H:%M:%S")"
+echo Done!
