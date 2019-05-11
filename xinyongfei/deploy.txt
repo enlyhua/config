@@ -143,6 +143,7 @@ for project in ${projects[@]}; do
 done
 
 
+//依次将代码拷贝到 server
 updated_web_servers=()
 for project in ${projects[@]}; do
     echo "Project: $project"
@@ -154,6 +155,7 @@ for project in ${projects[@]}; do
     git fetch 
     git checkout ${git_tags[$project]}
     if [ -d $root/projects/$project/config/files ]; then   // /sfy/projects/shoufuyou-php-lib/config/files
+        //将配置文件复制到代码目录
         cp -rf $root/projects/$project/config/files/* $repository_root
     fi
 
@@ -201,7 +203,7 @@ for project in ${projects[@]}; do
     // xinyongfei-app-api
 
 
-    //依次登录到 server 机器
+    //依次登录到 server 机器,
 
     is_compiled=NO
     for server in ${servers[@]}; do
@@ -269,11 +271,18 @@ for project in ${projects[@]}; do
             fi
             $rcmd "mkdir -p $release_root"
             rsync -azvessh --delete $repository_root/dist/* root@$server:$release_root/dist
+
         elif [[ $type == "website2" ]]; then
+
             rsync -azvessh --delete --exclude=/.git --exclude=/log --exclude=/data/dynamic --exclude=/tmp --exclude=/public/assets/* --include=/assets/dist --include=/assets/dist/* --exclude=/assets/* $repository_root/* root@$server:$release_root
+
         else
+
             rsync -azvessh --delete --exclude=/.git --exclude=/log --exclude=/data/dynamic --exclude=/tmp --include=/public/assets --include=/public/assets/$asset_version --exclude=/public/assets/* --exclude=/assets $repository_root/* root@$server:$release_root
+
         fi
+
+
         if [[ $type != "lib" ]] && [[ $type != "h5" ]]; then
             symlinks=(log data/dynamic tmp)
             for symlink in ${symlinks[@]}; do
