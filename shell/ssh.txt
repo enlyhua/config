@@ -1,0 +1,1 @@
+ssh root@172.17.0.148 "source /etc/profile; nohup /data/code/releases/xyf-union-backend/current/xyf-union-backend/yii bill/bill-replace $day > /dev/null 2>&1 &"
